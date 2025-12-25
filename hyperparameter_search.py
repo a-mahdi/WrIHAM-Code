@@ -2641,245 +2641,282 @@ class CheckpointManager:
 def run_trial(trial, config_base, data_index, rank=0, world_size=1):
     """
     Run a single hyperparameter search trial.
-    
+
     Args:
         trial: Optuna trial object
         config_base: Base configuration
         data_index: Pre-built data index (writers, writer2idx, split_data)
         rank: Process rank
         world_size: Number of GPUs
-    
+
     Returns:
         Best validation macro top-1 accuracy
     """
-    # Suggest hyperparameters
-    hyperparams = HyperparameterSpace.suggest_hyperparameters(trial)
-    
-    # Create trial configuration
-    config = TrialConfig(hyperparams, rank=rank)
-    
-    # Copy base config attributes
-    config.DATA_ROOT = config_base.DATA_ROOT
-    config.CHECKPOINT_DIR = config_base.CHECKPOINT_DIR
-    config.WRITERS = data_index[0]  # Writer names
-    config.NUM_CLASSES = len(config.WRITERS)
-    
-    # Print trial info (rank 0 only)
-    if rank == 0:
-        print("\n" + "="*70)
-        print(f"TRIAL {trial.number}")
-        print("="*70)
-        print(f"Model: {config.MODEL_TYPE}")
-        print(f"LR: {config.LEARNING_RATE:.2e}, WD: {config.WEIGHT_DECAY:.2e}")
-        print(f"Dropout: Emb={config.DROPOUT_EMBEDDING}, Clf={config.DROPOUT_CLASSIFIER}")
-        print(f"Loss: {'Focal' if config.USE_FOCAL_LOSS else 'CE+MixUp'} + {'Triplet' if config.USE_TRIPLET_LOSS else 'No Triplet'}")
-        print("="*70 + "\n")
-    
-    # Initialize checkpoint manager
-    checkpoint_manager = CheckpointManager(
-        base_dir=config.CHECKPOINT_DIR,
-        trial_number=trial.number
-    )
-    
-    if rank == 0:
-        checkpoint_manager.save_config(config)
-    
-    # Unpack data index
-    writers, writer2idx, split_data = data_index
-    
-    # Create datasets
-    train_dataset = ArabicLineDataset(
-        split_data['train']['lines'],
-        config,
-        is_train=True
-    )
-    
-    val_dataset = ArabicLineDataset(
-        split_data['val']['lines'],
-        config,
-        is_train=False
-    )
-    
-    # Create sampler
-    train_sampler = WriterBalancedSampler(
-        split_data['train']['lines'],
-        split_data['train']['pages'],
-        L=config.LINES_PER_PAGE_CAP,
-        Q_target=config.QUOTA_TARGET,
-        r_max=config.R_MAX
-    )
-    
-    if rank == 0:
-        train_sampler.print_sampler_info(writers, rank=rank)
-    
-    # Wrap with distributed sampler for DDP
-    if world_size > 1:
-        train_sampler_ddp = DistributedSamplerWrapper(
-            train_sampler,
-            num_replicas=world_size,
-            rank=rank
-        )
-    else:
-        train_sampler_ddp = train_sampler
-    
-    # Create data loaders
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=config.BATCH_SIZE_PER_GPU,
-        sampler=train_sampler_ddp,
-        num_workers=config.NUM_WORKERS,
-        pin_memory=True
-    )
-    
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=config.BATCH_SIZE_PER_GPU,
-        shuffle=False,
-        num_workers=config.NUM_WORKERS,
-        pin_memory=True
-    )
-    
-    # Create model
-    model = create_model(config, rank=rank)
-    model = model.to(rank)
-    
-    # Wrap with DDP
-    if world_size > 1:
-        model = DDP(model, device_ids=[rank], output_device=rank)
-    
-    # Create loss manager
-    loss_manager = LossManager(config)
-    
-    # Create optimizer and scheduler
-    optimizer = create_optimizer(model, config)
-    scheduler = create_scheduler(optimizer, config, len(train_loader))
-    scaler = GradScaler(enabled=config.USE_AMP)
-    
-    # Early stopping
-    early_stopping = EarlyStopping(
-        patience=config.EARLY_STOPPING_PATIENCE,
-        min_delta=config.EARLY_STOPPING_MIN_DELTA,
-        mode='max'
-    )
-    
-    # Training history
-    history = {
-        'train_loss': [],
-        'train_acc': [],
-        'val_macro_top1': [],
-        'val_macro_top5': [],
-        'val_macro_map': [],
-        'lr': []
-    }
-    
-    best_val_top1 = 0.0
-    
-    # Training loop
-    for epoch in range(config.EPOCHS):
-        # Train
-        train_loss, train_acc, loss_breakdown = train_epoch(
-            model, train_loader, loss_manager, optimizer, scheduler, scaler,
-            config, epoch, rank=rank
-        )
-        
-        history['train_loss'].append(train_loss)
-        history['train_acc'].append(train_acc)
-        history['lr'].append(scheduler.get_last_lr()[0])
-        
-        # Evaluate
-        val_results = evaluate_page_level(
-            model, val_loader,
-            split_data['val']['pages'],
-            rank, writers,
-            max_pages_per_writer=config.MAX_PAGES_PER_WRITER_VAL,
-            rank=rank,
-            return_predictions=True  # Get predictions for confusion matrix
-        )
-        
-        # Unpack results
-        if isinstance(val_results, tuple):
-            val_metrics, y_true, y_pred = val_results
-        else:
-            val_metrics = val_results
-            y_true, y_pred = None, None
-        
-        history['val_macro_top1'].append(val_metrics['macro_top1'])
-        history['val_macro_top5'].append(val_metrics['macro_top5'])
-        history['val_macro_map'].append(val_metrics['macro_map'])
-        
-        # Print results (rank 0 only)
+    try:
+        # Suggest hyperparameters
+        hyperparams = HyperparameterSpace.suggest_hyperparameters(trial)
+    except Exception as e:
         if rank == 0:
-            print(f"\n{'─'*70}")
-            print(f"Epoch {epoch+1}/{config.EPOCHS} Results:")
-            print(f"  Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.2f}%")
-            print(f"  Val Top-1: {val_metrics['macro_top1']*100:.2f}% | "
-                  f"Top-5: {val_metrics['macro_top5']*100:.2f}% | "
-                  f"mAP: {val_metrics['macro_map']:.4f}")
-            print(f"{'─'*70}")
-        
-        # Check if best
-        is_best = val_metrics['macro_top1'] > best_val_top1
-        if is_best:
-            best_val_top1 = val_metrics['macro_top1']
-            best_y_true = y_true
-            best_y_pred = y_pred
-        
-        # Save checkpoint
+            print(f"\n❌ Trial {trial.number} failed during hyperparameter suggestion: {e}")
+            import traceback
+            traceback.print_exc()
+        raise
+
+    try:
+        # Create trial configuration
+        config = TrialConfig(hyperparams, rank=rank)
+    
+        # Copy base config attributes
+        config.DATA_ROOT = config_base.DATA_ROOT
+        config.CHECKPOINT_DIR = config_base.CHECKPOINT_DIR
+        config.WRITERS = data_index[0]  # Writer names
+        config.NUM_CLASSES = len(config.WRITERS)
+    
+        # Print trial info (rank 0 only)
         if rank == 0:
-            metrics = {
-                'val_macro_top1': val_metrics['macro_top1'],
-                'val_macro_top5': val_metrics['macro_top5'],
-                'val_macro_map': val_metrics['macro_map'],
-                'per_writer_results': val_metrics['per_writer_results']
-            }
-            
-            checkpoint_manager.save_checkpoint(
-                epoch, model, optimizer, scheduler, scaler,
-                metrics, history, is_best=is_best
+            print("\n" + "="*70)
+            print(f"TRIAL {trial.number}")
+            print("="*70)
+            print(f"Model: {config.MODEL_TYPE}")
+            print(f"LR: {config.LEARNING_RATE:.2e}, WD: {config.WEIGHT_DECAY:.2e}")
+            print(f"Dropout: Emb={config.DROPOUT_EMBEDDING}, Clf={config.DROPOUT_CLASSIFIER}")
+            print(f"Loss: {'Focal' if config.USE_FOCAL_LOSS else 'CE+MixUp'} + {'Triplet' if config.USE_TRIPLET_LOSS else 'No Triplet'}")
+            print("="*70 + "\n")
+    
+        # Initialize checkpoint manager
+        checkpoint_manager = CheckpointManager(
+            base_dir=config.CHECKPOINT_DIR,
+            trial_number=trial.number
+        )
+    
+        if rank == 0:
+            checkpoint_manager.save_config(config)
+    
+        # Unpack data index
+        writers, writer2idx, split_data = data_index
+    
+        # Create datasets
+        train_dataset = ArabicLineDataset(
+            split_data['train']['lines'],
+            config,
+            is_train=True
+        )
+    
+        val_dataset = ArabicLineDataset(
+            split_data['val']['lines'],
+            config,
+            is_train=False
+        )
+    
+        # Create sampler
+        train_sampler = WriterBalancedSampler(
+            split_data['train']['lines'],
+            split_data['train']['pages'],
+            L=config.LINES_PER_PAGE_CAP,
+            Q_target=config.QUOTA_TARGET,
+            r_max=config.R_MAX
+        )
+    
+        if rank == 0:
+            train_sampler.print_sampler_info(writers, rank=rank)
+    
+        # Wrap with distributed sampler for DDP
+        if world_size > 1:
+            train_sampler_ddp = DistributedSamplerWrapper(
+                train_sampler,
+                num_replicas=world_size,
+                rank=rank
             )
-            
-            # Save plots periodically
-            if (epoch + 1) % 5 == 0 or is_best:
-                checkpoint_manager.save_training_plots(history, epoch)
-                
-                # Save confusion matrix for best epoch
-                if is_best and y_true is not None and y_pred is not None:
-                    checkpoint_manager.save_confusion_matrix(y_true, y_pred, writers, normalize=True)
-                    checkpoint_manager.save_confusion_matrix(y_true, y_pred, writers, normalize=False)
-        
-        # Report to Optuna (for pruning)
-        trial.report(val_results['macro_top1'], epoch)
-        
-        # Check if trial should be pruned
-        if trial.should_prune():
-            if rank == 0:
-                print(f"\n⚠️  Trial {trial.number} pruned at epoch {epoch+1}")
-            raise optuna.TrialPruned()
-        
+        else:
+            train_sampler_ddp = train_sampler
+    
+        # Create data loaders
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=config.BATCH_SIZE_PER_GPU,
+            sampler=train_sampler_ddp,
+            num_workers=config.NUM_WORKERS,
+            pin_memory=True
+        )
+    
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=config.BATCH_SIZE_PER_GPU,
+            shuffle=False,
+            num_workers=config.NUM_WORKERS,
+            pin_memory=True
+        )
+    
+        # Create model
+        model = create_model(config, rank=rank)
+        model = model.to(rank)
+    
+        # Wrap with DDP
+        if world_size > 1:
+            model = DDP(model, device_ids=[rank], output_device=rank)
+    
+        # Create loss manager
+        loss_manager = LossManager(config)
+    
+        # Create optimizer and scheduler
+        optimizer = create_optimizer(model, config)
+        scheduler = create_scheduler(optimizer, config, len(train_loader))
+        scaler = GradScaler(enabled=config.USE_AMP)
+    
         # Early stopping
-        if early_stopping(val_results['macro_top1'], epoch):
-            if rank == 0:
-                print(f"\n🛑 Early stopping at epoch {epoch+1}")
-            break
+        early_stopping = EarlyStopping(
+            patience=config.EARLY_STOPPING_PATIENCE,
+            min_delta=config.EARLY_STOPPING_MIN_DELTA,
+            mode='max'
+        )
     
-    # Save final results (rank 0 only)
-    if rank == 0:
-        final_metrics = {
-            'val_macro_top1': best_val_top1,
-            'val_macro_top5': history['val_macro_top5'][np.argmax(history['val_macro_top1'])],
-            'val_macro_map': history['val_macro_map'][np.argmax(history['val_macro_top1'])],
-            'per_writer_results': val_results['per_writer_results']
+        # Training history
+        history = {
+            'train_loss': [],
+            'train_acc': [],
+            'val_macro_top1': [],
+            'val_macro_top5': [],
+            'val_macro_map': [],
+            'lr': []
         }
-        
-        checkpoint_manager.save_final_model(model, final_metrics, history)
-        checkpoint_manager.save_training_plots(history, len(history['train_loss'])-1)
-        checkpoint_manager.save_per_writer_plot(val_results['per_writer_results'], writers)
-        checkpoint_manager.save_learning_rate_plot(history['lr'])
-        checkpoint_manager.save_trial_summary(config, final_metrics, history, rank=rank)
-        
-        print(f"\n✅ Trial {trial.number} completed | Best Val Top-1: {best_val_top1*100:.2f}%\n")
     
-    return best_val_top1
+        best_val_top1 = 0.0
+    
+        # Training loop
+        for epoch in range(config.EPOCHS):
+            # Train
+            train_loss, train_acc, loss_breakdown = train_epoch(
+                model, train_loader, loss_manager, optimizer, scheduler, scaler,
+                config, epoch, rank=rank
+            )
+        
+            history['train_loss'].append(train_loss)
+            history['train_acc'].append(train_acc)
+            history['lr'].append(scheduler.get_last_lr()[0])
+        
+            # Evaluate
+            val_results = evaluate_page_level(
+                model, val_loader,
+                split_data['val']['pages'],
+                rank, writers,
+                max_pages_per_writer=config.MAX_PAGES_PER_WRITER_VAL,
+                rank=rank,
+                return_predictions=True  # Get predictions for confusion matrix
+            )
+        
+            # Unpack results
+            if isinstance(val_results, tuple):
+                val_metrics, y_true, y_pred = val_results
+            else:
+                val_metrics = val_results
+                y_true, y_pred = None, None
+        
+            history['val_macro_top1'].append(val_metrics['macro_top1'])
+            history['val_macro_top5'].append(val_metrics['macro_top5'])
+            history['val_macro_map'].append(val_metrics['macro_map'])
+        
+            # Print results (rank 0 only)
+            if rank == 0:
+                print(f"\n{'─'*70}")
+                print(f"Epoch {epoch+1}/{config.EPOCHS} Results:")
+                print(f"  Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.2f}%")
+                print(f"  Val Top-1: {val_metrics['macro_top1']*100:.2f}% | "
+                      f"Top-5: {val_metrics['macro_top5']*100:.2f}% | "
+                      f"mAP: {val_metrics['macro_map']:.4f}")
+                print(f"{'─'*70}")
+        
+            # Check if best
+            is_best = val_metrics['macro_top1'] > best_val_top1
+            if is_best:
+                best_val_top1 = val_metrics['macro_top1']
+                best_y_true = y_true
+                best_y_pred = y_pred
+        
+            # Save checkpoint
+            if rank == 0:
+                metrics = {
+                    'val_macro_top1': val_metrics['macro_top1'],
+                    'val_macro_top5': val_metrics['macro_top5'],
+                    'val_macro_map': val_metrics['macro_map'],
+                    'per_writer_results': val_metrics['per_writer_results']
+                }
+            
+                checkpoint_manager.save_checkpoint(
+                    epoch, model, optimizer, scheduler, scaler,
+                    metrics, history, is_best=is_best
+                )
+            
+                # Save plots periodically
+                if (epoch + 1) % 5 == 0 or is_best:
+                    checkpoint_manager.save_training_plots(history, epoch)
+                
+                    # Save confusion matrix for best epoch
+                    if is_best and y_true is not None and y_pred is not None:
+                        checkpoint_manager.save_confusion_matrix(y_true, y_pred, writers, normalize=True)
+                        checkpoint_manager.save_confusion_matrix(y_true, y_pred, writers, normalize=False)
+        
+            # Report to Optuna (for pruning)
+            trial.report(val_results['macro_top1'], epoch)
+        
+            # Check if trial should be pruned
+            if trial.should_prune():
+                if rank == 0:
+                    print(f"\n⚠️  Trial {trial.number} pruned at epoch {epoch+1}")
+                raise optuna.TrialPruned()
+        
+            # Early stopping
+            if early_stopping(val_results['macro_top1'], epoch):
+                if rank == 0:
+                    print(f"\n🛑 Early stopping at epoch {epoch+1}")
+                break
+    
+        # Save final results (rank 0 only)
+        if rank == 0:
+            final_metrics = {
+                'val_macro_top1': best_val_top1,
+                'val_macro_top5': history['val_macro_top5'][np.argmax(history['val_macro_top1'])],
+                'val_macro_map': history['val_macro_map'][np.argmax(history['val_macro_top1'])],
+                'per_writer_results': val_results['per_writer_results']
+            }
+        
+            checkpoint_manager.save_final_model(model, final_metrics, history)
+            checkpoint_manager.save_training_plots(history, len(history['train_loss'])-1)
+            checkpoint_manager.save_per_writer_plot(val_results['per_writer_results'], writers)
+            checkpoint_manager.save_learning_rate_plot(history['lr'])
+            checkpoint_manager.save_trial_summary(config, final_metrics, history, rank=rank)
+        
+            print(f"\n✅ Trial {trial.number} completed | Best Val Top-1: {best_val_top1*100:.2f}%\n")
+
+        return best_val_top1
+
+    except optuna.TrialPruned:
+        # Trial was pruned - this is expected, re-raise
+        if rank == 0:
+            print(f"\n⚠️  Trial {trial.number} was pruned (early stopping by Optuna)")
+        raise
+
+    except Exception as e:
+        # Unexpected error - log and fail the trial
+        if rank == 0:
+            print(f"\n❌ Trial {trial.number} FAILED with error: {e}")
+            import traceback
+            traceback.print_exc()
+
+            # Save error log to trial directory
+            try:
+                error_log_path = Path(config_base.CHECKPOINT_DIR) / f'trial_{trial.number:03d}' / 'error.log'
+                error_log_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(error_log_path, 'w') as f:
+                    f.write(f"Trial {trial.number} failed at {datetime.now()}\n")
+                    f.write(f"Error: {e}\n\n")
+                    f.write("Traceback:\n")
+                    traceback.print_exc(file=f)
+                print(f"   Error log saved to: {error_log_path}")
+            except:
+                pass
+
+        # Re-raise the exception so Optuna marks this trial as failed
+        raise
 
 
 print("✅ Section 7: Checkpoint management and trial execution complete")
@@ -3225,28 +3262,72 @@ def distributed_worker(rank, world_size, config_base, n_trials):
     # Only rank 0 creates and manages Optuna study
     if rank == 0:
         HyperparameterSpace.print_search_space_summary()
-        
-        # Create Optuna study
-        study = optuna.create_study(
-            study_name='arabic_writer_id_hyperparam_search',
-            direction='maximize',
-            sampler=TPESampler(seed=42),
-            pruner=MedianPruner(n_startup_trials=5, n_warmup_steps=10)
-        )
-        
-        print(f"\n{'='*70}")
-        print(f"STARTING HYPERPARAMETER SEARCH")
-        print(f"{'='*70}")
-        print(f"Number of trials: {n_trials}")
-        print(f"Optimization metric: Validation Macro Top-1 Accuracy")
-        print(f"{'='*70}\n")
-        
+
+        # Ensure checkpoint directory exists
+        checkpoint_dir = Path(config_base.CHECKPOINT_DIR)
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+        # Create SQLite storage for persistence (resumability)
+        storage_path = checkpoint_dir / 'optuna_study.db'
+        storage = f'sqlite:///{storage_path}'
+        study_name = 'arabic_writer_id_hyperparam_search'
+
+        # Load or create study
+        try:
+            study = optuna.load_study(
+                study_name=study_name,
+                storage=storage
+            )
+            n_completed = len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE])
+            n_pruned = len([t for t in study.trials if t.state == optuna.trial.TrialState.PRUNED])
+            n_failed = len([t for t in study.trials if t.state == optuna.trial.TrialState.FAIL])
+
+            print(f"\n{'='*70}")
+            print(f"RESUMING EXISTING STUDY")
+            print(f"{'='*70}")
+            print(f"Study loaded from: {storage_path}")
+            print(f"Completed trials: {n_completed}")
+            print(f"Pruned trials: {n_pruned}")
+            print(f"Failed trials: {n_failed}")
+            print(f"Remaining trials: {max(0, n_trials - n_completed - n_pruned - n_failed)}")
+            if n_completed > 0:
+                print(f"Best value so far: {study.best_trial.value*100:.2f}%")
+            print(f"{'='*70}\n")
+
+        except KeyError:
+            # Study doesn't exist, create new one
+            study = optuna.create_study(
+                study_name=study_name,
+                storage=storage,
+                direction='maximize',
+                sampler=TPESampler(seed=42),
+                pruner=MedianPruner(n_startup_trials=5, n_warmup_steps=10),
+                load_if_exists=False
+            )
+
+            print(f"\n{'='*70}")
+            print(f"STARTING NEW HYPERPARAMETER SEARCH")
+            print(f"{'='*70}")
+            print(f"Study database: {storage_path}")
+            print(f"Number of trials: {n_trials}")
+            print(f"Optimization metric: Validation Macro Top-1 Accuracy")
+            print(f"Note: This search is resumable. You can safely stop and restart.")
+            print(f"{'='*70}\n")
+
         # Run optimization
-        study.optimize(
-            lambda trial: run_trial(trial, config_base, data_index, rank, world_size),
-            n_trials=n_trials,
-            show_progress_bar=True
-        )
+        # Calculate how many trials still needed
+        n_completed = len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE])
+        n_remaining = max(0, n_trials - n_completed)
+
+        if n_remaining > 0:
+            study.optimize(
+                lambda trial: run_trial(trial, config_base, data_index, rank, world_size),
+                n_trials=n_remaining,
+                show_progress_bar=True
+            )
+        else:
+            print(f"\n✅ All {n_trials} trials already completed. Skipping optimization.")
+            print(f"   Use --n_trials to run more trials.\n")
         
         # Print results
         print("\n" + "="*70)
