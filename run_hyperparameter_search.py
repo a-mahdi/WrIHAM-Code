@@ -1739,14 +1739,44 @@ def train_epoch(model, loader, loss_manager, optimizer, scheduler, scaler,
             total_loss, loss_dict = loss_manager.compute_loss(
                 model, images, labels, return_metrics=True
             )
-        
+
+        # ========== NaN/Inf Detection ==========
+        # Critical: Detect NaN/Inf immediately to prevent wasted training
+        if torch.isnan(total_loss) or torch.isinf(total_loss):
+            print(f"\n{'='*70}")
+            print(f"❌ CRITICAL ERROR: Loss became {'NaN' if torch.isnan(total_loss) else 'Inf'}")
+            print(f"{'='*70}")
+            print(f"Epoch: {epoch+1}, Batch: {batch_idx+1}/{len(loader)}")
+            print(f"Total Loss: {total_loss.item()}")
+            print(f"Classification Loss: {loss_dict['cls_loss']:.4f}")
+            if 'triplet_loss' in loss_dict:
+                print(f"Triplet Loss: {loss_dict['triplet_loss']:.4f}")
+            print(f"\nThis indicates training instability. Possible causes:")
+            print(f"  • Learning rate too high")
+            print(f"  • Gradient explosion")
+            print(f"  • Numerical instability in loss function")
+            print(f"{'='*70}\n")
+            raise ValueError(f"Training failed: Loss became {'NaN' if torch.isnan(total_loss) else 'Inf'} at epoch {epoch+1}, batch {batch_idx+1}")
+
         # Backward pass
         scaler.scale(total_loss).backward()
-        
-        # Gradient clipping
+
+        # ========== Gradient Monitoring & Clipping ==========
         scaler.unscale_(optimizer)
+
+        # Compute gradient norm BEFORE clipping (for monitoring)
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), float('inf'))
+
+        # Check for extremely high gradients (indicates instability)
+        if grad_norm > 100.0:
+            if rank == 0 and batch_idx % 10 == 0:  # Print occasionally
+                print(f"\n⚠️  WARNING: High gradient norm detected: {grad_norm:.2f}")
+                print(f"   This may indicate training instability")
+                print(f"   Gradient will be clipped to {config.GRADIENT_CLIP_NORM:.2f}\n")
+
+        # Actually clip gradients to configured max norm
         torch.nn.utils.clip_grad_norm_(model.parameters(), config.GRADIENT_CLIP_NORM)
-        
+
         # Optimizer step
         scaler.step(optimizer)
         scaler.update()
@@ -2608,7 +2638,13 @@ def run_trial(trial, config_base, data_index):
         config.CHECKPOINT_DIR = config_base.CHECKPOINT_DIR
         config.WRITERS = data_index[0]  # Writer names
         config.NUM_CLASSES = len(config.WRITERS)
-    
+
+        # ========== Validate Configuration ==========
+        # Ensure batch size is reasonable (prevent tiny batches that cause issues)
+        if config.BATCH_SIZE < 16:
+            raise ValueError(f"Batch size {config.BATCH_SIZE} is too small! Minimum is 16. "
+                           f"Small batches can cause training instability and poor performance.")
+
         # Print trial info
         print("\n" + "="*70)
         print(f"TRIAL {trial.number}")
@@ -2708,7 +2744,17 @@ def run_trial(trial, config_base, data_index):
                 model, train_loader, loss_manager, optimizer, scheduler, scaler,
                 config, epoch, rank=rank
             )
-        
+
+            # ========== Sanity Check: Detect NaN in returned loss ==========
+            if np.isnan(train_loss) or np.isinf(train_loss):
+                if rank == 0:
+                    print(f"\n{'='*70}")
+                    print(f"❌ TRAINING FAILED: Epoch {epoch+1} returned {'NaN' if np.isnan(train_loss) else 'Inf'} loss")
+                    print(f"{'='*70}")
+                    print(f"Training will be stopped to prevent wasted computation.")
+                    print(f"This trial will be marked as failed.\n")
+                raise ValueError(f"Training failed at epoch {epoch+1}: loss is {'NaN' if np.isnan(train_loss) else 'Inf'}")
+
             history['train_loss'].append(train_loss)
             history['train_acc'].append(train_acc)
             history['lr'].append(scheduler.get_last_lr()[0])
