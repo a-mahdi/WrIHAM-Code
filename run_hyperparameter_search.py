@@ -149,6 +149,9 @@ class BaseConfig:
     # Device
     DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
+    # Quick test mode (set via command line --quick_test)
+    QUICK_TEST = False
+
 
 # ============================================================
 # HYPERPARAMETER SEARCH SPACE
@@ -158,14 +161,18 @@ class HyperparameterSpace:
     """Define the hyperparameter search space optimized for 12 trials."""
     
     @staticmethod
-    def suggest_hyperparameters(trial):
+    def suggest_hyperparameters(trial, quick_test=False):
         """
         Suggest hyperparameters for a trial.
-        
+
         Strategy for 12 trials:
         - Focus on most impactful parameters
         - Strong regularization to combat overfitting
         - Model-specific configurations for ConvNeXt vs ViT
+
+        Args:
+            trial: Optuna trial object
+            quick_test: If True, use smaller batch size for fast testing
         """
         
         # ========== MODEL ARCHITECTURE ==========
@@ -256,7 +263,10 @@ class HyperparameterSpace:
         # ========== BATCH SIZE ==========
         # Fixed batch size for 12 trials (reduce search space)
         # Can adjust based on GPU memory
-        batch_size = 128  # Fixed for simplicity
+        if quick_test:
+            batch_size = 32  # Small batch for quick testing
+        else:
+            batch_size = 128  # Full batch for production
         
         return {
             'model_type': model_type,
@@ -2622,7 +2632,7 @@ def run_trial(trial, config_base, data_index):
     """
     try:
         # Suggest hyperparameters
-        hyperparams = HyperparameterSpace.suggest_hyperparameters(trial)
+        hyperparams = HyperparameterSpace.suggest_hyperparameters(trial, quick_test=config_base.QUICK_TEST)
     except Exception as e:
         print(f"\n❌ Trial {trial.number} failed during hyperparameter suggestion: {e}")
         import traceback
@@ -2680,9 +2690,11 @@ def run_trial(trial, config_base, data_index):
         )
     
         # Create sampler
+        # Use fewer lines per writer in quick test mode
+        quota_per_writer = 50 if config_base.QUICK_TEST else 300
         train_sampler = WriterBalancedSampler(
             split_data['train']['lines'],
-            quota_per_writer=300,
+            quota_per_writer=quota_per_writer,
             max_exposure=2
         )
 
@@ -3357,6 +3369,9 @@ def run_parallel_search(args, num_gpus):
         else:
             cmd.extend(["--num_writers_subset", str(args.num_writers_subset)])
 
+        if args.quick_test:
+            cmd.append("--quick_test")
+
         # Create log file
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         log_file = log_dir / f"worker_gpu{gpu_id}_{timestamp}.log"
@@ -3471,8 +3486,32 @@ Example:
                    help='Number of writers if not using all (default: 7)')
     parser.add_argument('--single_gpu_mode', action='store_true',
                    help='Force single GPU mode (internal flag for parallel workers)')
+    parser.add_argument('--quick_test', action='store_true',
+                   help='Quick test mode: 3 writers, 50 lines/writer, 32 batch size, 5 epochs, 2 trials')
 
     args = parser.parse_args()
+
+    # ========== QUICK TEST MODE ==========
+    # Override parameters for fast testing
+    if args.quick_test:
+        print("\n" + "🚀"*35)
+        print("QUICK TEST MODE ENABLED")
+        print("🚀"*35)
+        print("\n⚡ Quick Test Parameters:")
+        print("  • Writers: 3 (instead of all 21)")
+        print("  • Lines per writer: 50 (instead of 300)")
+        print("  • Batch size: 32 (instead of 128)")
+        print("  • Epochs: 5 (instead of 30)")
+        print("  • Trials: 2 (instead of 12)")
+        print("  • Max pages per writer (val): 3 (instead of 20)")
+        print("\n⏱️  Estimated time: ~5-10 minutes per trial")
+        print("🎯 Purpose: Verify code works before full run\n")
+        print("="*70 + "\n")
+
+        # Override arguments
+        args.n_trials = 2
+        args.num_writers_subset = 3
+        args.use_all_writers = False  # Force subset mode
 
     # Detect number of GPUs
     num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
@@ -3502,6 +3541,13 @@ Example:
         config_base.CHECKPOINT_DIR = args.checkpoint_dir
         config_base.USE_ALL_WRITERS = args.use_all_writers
         config_base.NUM_WRITERS_SUBSET = args.num_writers_subset
+        config_base.QUICK_TEST = args.quick_test
+
+        # Override parameters for quick test
+        if args.quick_test:
+            config_base.EPOCHS = 5  # Fast iterations
+            config_base.MAX_PAGES_PER_WRITER_VAL = 3  # Less validation data
+            config_base.EARLY_STOPPING_PATIENCE = 3  # Stop faster
 
         # Run hyperparameter search
         run_hyperparameter_search(config_base, args.n_trials)
