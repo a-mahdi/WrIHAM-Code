@@ -1,15 +1,25 @@
 #!/usr/bin/env python3
 """
-Arabic Writer Identification - Hyperparameter Search (Single GPU)
-Bayesian Optimization using Optuna
+Arabic Writer Identification - Hyperparameter Search (Auto Multi-GPU)
+Bayesian Optimization using Optuna with Automatic GPU Detection
 
 Task: Find optimal hyperparameters for both ConvNeXt and Transformer models
 Data: Historical Arabic manuscript line images
 Optimization: Bayesian search with early stopping
-Single GPU: Optimized for single GPU training
+
+GPU Modes (Automatic):
+- 1 GPU: Sequential trials on single GPU
+- 2+ GPUs: Parallel trials (one trial per GPU) for 4x speedup
+
+Usage:
+    python run_hyperparameter_search.py \\
+        --data_root /path/to/data \\
+        --checkpoint_dir /path/to/checkpoints \\
+        --n_trials 24 \\
+        --use_all_writers
 
 Author: Generated for HPC server
-Date: 2025-12-25
+Date: 2025-12-27
 """
 
 # ============================================================
@@ -22,6 +32,9 @@ import random
 import pickle
 import json
 import argparse
+import subprocess
+import signal
+import time
 from pathlib import Path
 from collections import defaultdict, Counter
 from datetime import datetime
@@ -3193,39 +3206,225 @@ def run_hyperparameter_search(config_base, n_trials):
 
 
 # ============================================================
+# PARALLEL MODE (MULTI-GPU)
+# ============================================================
+
+def run_parallel_search(args, num_gpus):
+    """
+    Run parallel hyperparameter search with one trial per GPU.
+
+    Args:
+        args: Command line arguments
+        num_gpus: Number of GPUs available
+    """
+    print("\n" + "="*70)
+    print("PARALLEL HYPERPARAMETER SEARCH")
+    print("="*70)
+    print(f"Available GPUs: {num_gpus}")
+    print(f"Total trials: {args.n_trials}")
+    print(f"Trials per GPU: ~{args.n_trials // num_gpus}")
+    print(f"Checkpoint dir: {args.checkpoint_dir}")
+    print(f"Data root: {args.data_root}")
+    print("="*70)
+
+    # Create checkpoint and log directories
+    Path(args.checkpoint_dir).mkdir(parents=True, exist_ok=True)
+    log_dir = Path(args.checkpoint_dir) / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    print("\n🚀 Launching workers...\n")
+
+    processes = []
+
+    # Register signal handler for graceful shutdown
+    def signal_handler(signum, frame):
+        print("\n\n" + "="*70)
+        print("🛑 INTERRUPT RECEIVED - Gracefully stopping all workers...")
+        print("="*70)
+        for i, proc in enumerate(processes):
+            if proc.poll() is None:
+                print(f"  Stopping worker on GPU {i}...")
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    print(f"  Force killing worker on GPU {i}...")
+                    proc.kill()
+        print("✅ All workers stopped")
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
+    # Launch one worker per GPU
+    for gpu_id in range(num_gpus):
+        # Build command
+        cmd = [
+            sys.executable,
+            __file__,  # This script
+            "--data_root", args.data_root,
+            "--checkpoint_dir", args.checkpoint_dir,
+            "--n_trials", str(args.n_trials),
+            "--single_gpu_mode",  # Flag to run in single GPU mode
+        ]
+
+        if args.use_all_writers:
+            cmd.append("--use_all_writers")
+        else:
+            cmd.extend(["--num_writers_subset", str(args.num_writers_subset)])
+
+        # Create log file
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_file = log_dir / f"worker_gpu{gpu_id}_{timestamp}.log"
+
+        # Set environment to restrict to single GPU
+        env = os.environ.copy()
+        env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+
+        # Launch process
+        log_handle = open(log_file, 'w')
+        proc = subprocess.Popen(
+            cmd,
+            env=env,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1
+        )
+
+        processes.append(proc)
+        print(f"  ✅ GPU {gpu_id}: Worker launched (PID {proc.pid})")
+        print(f"     Log: {log_file}")
+
+        # Small delay to stagger database access
+        time.sleep(2)
+
+    print("\n" + "="*70)
+    print("ALL WORKERS LAUNCHED")
+    print("="*70)
+    print("\n📊 Monitor progress:")
+    print(f"  • Check logs: {log_dir}")
+    print(f"  • Check trials: {Path(args.checkpoint_dir) / 'trial_*'}")
+    print(f"  • Database: {Path(args.checkpoint_dir) / 'optuna_study.db'}")
+    print("\n💡 Tips:")
+    print("  • Each worker pulls trials from shared Optuna database")
+    print("  • Workers run independently and may finish at different times")
+    print("  • Press Ctrl+C to stop all workers gracefully")
+    print("  • If interrupted, resume with the same command")
+    print("\n⏳ Waiting for workers to complete...\n")
+
+    # Wait for all workers to complete
+    completed = []
+    try:
+        while len(completed) < num_gpus:
+            for i, proc in enumerate(processes):
+                if i in completed:
+                    continue
+
+                retcode = proc.poll()
+                if retcode is not None:
+                    completed.append(i)
+                    if retcode == 0:
+                        print(f"  ✅ GPU {i} worker completed successfully")
+                    else:
+                        print(f"  ⚠️  GPU {i} worker exited with code {retcode}")
+
+            time.sleep(5)
+
+    except KeyboardInterrupt:
+        signal_handler(None, None)
+
+    print("\n" + "="*70)
+    print("ALL WORKERS COMPLETED")
+    print("="*70)
+
+    failures = [i for i, proc in enumerate(processes) if proc.returncode != 0]
+    if failures:
+        print(f"\n⚠️  Some workers failed: GPUs {failures}")
+        print("   Check logs for details")
+    else:
+        print("\n✅ All workers completed successfully!")
+
+    print(f"\n📁 Results saved to: {args.checkpoint_dir}")
+    print(f"   • Summary: {Path(args.checkpoint_dir) / 'summary'}")
+    print(f"   • Best model: {Path(args.checkpoint_dir) / 'best_overall'}")
+    print("="*70 + "\n")
+
+
+# ============================================================
 # MAIN ENTRY POINT
 # ============================================================
 
 def main():
-    """Main entry point for hyperparameter search (single GPU)."""
+    """Main entry point for hyperparameter search with automatic GPU detection."""
 
     # Parse arguments
-    parser = argparse.ArgumentParser(description='Arabic Writer Identification - Hyperparameter Search (Single GPU)')
+    parser = argparse.ArgumentParser(
+        description='Arabic Writer Identification - Hyperparameter Search (Auto Multi-GPU)',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+GPU Modes (Automatic):
+  • 1 GPU: Sequential trials on single GPU
+  • 2+ GPUs: Parallel trials (one trial per GPU) for 4x speedup
+
+Example:
+  python run_hyperparameter_search.py \\
+    --data_root /path/to/data \\
+    --checkpoint_dir /path/to/checkpoints \\
+    --n_trials 24 \\
+    --use_all_writers
+        """
+    )
     parser.add_argument('--data_root', type=str, required=True,
                    help='Path to Mirath_extracted_lines directory')
     parser.add_argument('--checkpoint_dir', type=str, required=True,
                    help='Directory to save checkpoints and results')
     parser.add_argument('--n_trials', type=int, default=12,
-                   help='Number of trials (default: 12)')
+                   help='Total number of trials to run (default: 12)')
     parser.add_argument('--use_all_writers', action='store_true',
-                   help='Use all 21 writers (default: True)')
+                   help='Use all writers')
     parser.add_argument('--num_writers_subset', type=int, default=7,
                    help='Number of writers if not using all (default: 7)')
+    parser.add_argument('--single_gpu_mode', action='store_true',
+                   help='Force single GPU mode (internal flag for parallel workers)')
 
     args = parser.parse_args()
 
-    # Set seed
-    set_seed(42)
+    # Detect number of GPUs
+    num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
 
-    # Create base config
-    config_base = BaseConfig()
-    config_base.DATA_ROOT = args.data_root
-    config_base.CHECKPOINT_DIR = args.checkpoint_dir
-    config_base.USE_ALL_WRITERS = args.use_all_writers
-    config_base.NUM_WRITERS_SUBSET = args.num_writers_subset
+    if num_gpus == 0:
+        print("❌ No GPUs available. This script requires CUDA-capable GPUs.")
+        sys.exit(1)
 
-    # Run hyperparameter search
-    run_hyperparameter_search(config_base, args.n_trials)
+    # Decide mode: parallel or single GPU
+    if args.single_gpu_mode or num_gpus == 1:
+        # Single GPU mode
+        print(f"\n{'='*70}")
+        print("SINGLE GPU MODE")
+        print(f"{'='*70}")
+        if args.single_gpu_mode:
+            print("Running as worker in parallel mode")
+        else:
+            print(f"Detected: {num_gpus} GPU")
+        print(f"{'='*70}\n")
+
+        # Set seed
+        set_seed(42)
+
+        # Create base config
+        config_base = BaseConfig()
+        config_base.DATA_ROOT = args.data_root
+        config_base.CHECKPOINT_DIR = args.checkpoint_dir
+        config_base.USE_ALL_WRITERS = args.use_all_writers
+        config_base.NUM_WRITERS_SUBSET = args.num_writers_subset
+
+        # Run hyperparameter search
+        run_hyperparameter_search(config_base, args.n_trials)
+
+    else:
+        # Multi-GPU parallel mode
+        run_parallel_search(args, num_gpus)
 
 
 if __name__ == '__main__':
@@ -3234,13 +3433,18 @@ if __name__ == '__main__':
 
 print("✅ Section 8: Main execution and summary analysis complete")
 print("\n" + "="*70)
-print("SINGLE GPU HYPERPARAMETER SEARCH SCRIPT READY")
+print("AUTO MULTI-GPU HYPERPARAMETER SEARCH SCRIPT READY")
 print("="*70)
+print("\nFeatures:")
+print("  • 1 GPU: Automatic sequential mode")
+print("  • 2+ GPUs: Automatic parallel mode (one trial per GPU)")
+print("  • Fully resumable with SQLite database")
+print("  • Graceful shutdown with Ctrl+C")
 print("\nUsage:")
-print("  python single_gpu_hyperparameter_search.py \\")
-print("    --data_root /project/mamro/Mirath_extracted_lines \\")
-print("    --checkpoint_dir /project/mamro/checkpoints/hyperparam_search \\")
-print("    --n_trials 12 \\")
+print("  python run_hyperparameter_search.py \\")
+print("    --data_root /path/to/Mirath_extracted_lines \\")
+print("    --checkpoint_dir /path/to/checkpoints \\")
+print("    --n_trials 24 \\")
 print("    --use_all_writers")
 print("\n" + "="*70)
 
