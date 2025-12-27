@@ -221,12 +221,6 @@ class HyperparameterSpace:
             triplet_weight = 0.0
             triplet_margin = 0.5
         
-        # ========== SAMPLER PARAMETERS ==========
-        # Balanced sampling to prevent overfitting on frequent writers
-        lines_per_page_cap = trial.suggest_int('lines_per_page_cap', 40, 70, step=10)
-        quota_target = trial.suggest_int('quota_target', 250, 350, step=50)
-        r_max = trial.suggest_float('r_max', 1.5, 2.5)
-        
         # ========== MODEL-SPECIFIC PARAMETERS ==========
         if model_type == 'convnext':
             # ConvNeXt-specific
@@ -280,9 +274,6 @@ class HyperparameterSpace:
             'use_triplet_loss': use_triplet,
             'triplet_weight': triplet_weight,
             'triplet_margin': triplet_margin,
-            'lines_per_page_cap': lines_per_page_cap,
-            'quota_target': quota_target,
-            'r_max': r_max,
             'embedding_dim': embedding_dim,
             'freeze_backbone': freeze_backbone,
             'freeze_layers': freeze_layers,
@@ -322,9 +313,8 @@ class HyperparameterSpace:
         print("    - Freeze layers: [6, 10] (if enabled)")
         print("    - Attention dropout: [0.1, 0.3]")
         print("\n📦 SAMPLER (Balanced):")
-        print("  • Lines per page cap: [40, 70]")
-        print("  • Quota target: [250, 350]")
-        print("  • R_max: [1.5, 2.5]")
+        print("  • Quota per writer: 300 (fixed)")
+        print("  • Max exposure per line: 2 (fixed)")
         print("\n🎓 TRAINING:")
         print("  • Batch size: 128 (fixed)")
         print("  • Warmup: [5, 10] epochs")
@@ -694,167 +684,215 @@ print("✅ Section 2: Data indexing and preprocessing complete")
 
 class WriterBalancedSampler(Sampler):
     """
-    Writer-balanced sampler with per-page cap and exposure tracking.
-    
-    This sampler ensures balanced representation across writers by:
-    1. Capping lines per page (L) to prevent page domination
-    2. Setting per-writer quota (Q_w) based on available data
-    3. Tracking line exposure to ensure even data distribution
-    4. Without-replacement sampling within epochs
-    
+    Simplified writer-balanced sampler with exposure tracking.
+
     Algorithm:
-    - Cap each page at L lines per epoch
-    - Calculate per-writer quota: Q_w = min(Q_target, P_w * L, r_max * N_w)
-      where P_w = number of pages, N_w = number of lines for writer w
-    - Track exposure per line across epochs
-    - Sample lines with lowest exposure first (fairness)
-    - Round-robin across writers until quotas filled
-    
+    1. Each writer gets 300 lines per epoch (QUOTA_PER_WRITER)
+    2. Sample lines with lowest exposure first (fairness)
+    3. Maximum exposure per line: 2 (MAX_EXPOSURE)
+    4. Track coverage: which lines have been seen
+
     Args:
         lines: List of line dictionaries
-        pages: Dict mapping page_id -> [line_indices]
-        L: Lines per page cap (from config.LINES_PER_PAGE_CAP)
-        Q_target: Target quota per writer (from config.QUOTA_TARGET)
-        r_max: Max oversampling ratio (from config.R_MAX)
+        quota_per_writer: Lines per writer per epoch (default: 300)
+        max_exposure: Maximum times a line can be sampled (default: 2)
     """
-    
-    def __init__(self, lines, pages, L, Q_target, r_max):
+
+    def __init__(self, lines, quota_per_writer=300, max_exposure=2):
         self.lines = lines
-        self.pages = pages
-        self.L = L
-        self.Q_target = Q_target
-        self.r_max = r_max
-        
+        self.quota_per_writer = quota_per_writer
+        self.max_exposure = max_exposure
+
         # Group lines by writer
         self.writer_lines = defaultdict(list)
-        self.writer_pages = defaultdict(set)
-        
         for idx, line in enumerate(lines):
             writer_idx = line['writer_idx']
             self.writer_lines[writer_idx].append(idx)
-            self.writer_pages[writer_idx].add(line['page_id'])
-        
+
         self.writers = sorted(self.writer_lines.keys())
-        
-        # Calculate quotas per writer
-        self.writer_quotas = {}
-        for w in self.writers:
-            N_w = len(self.writer_lines[w])  # Total lines for writer w
-            P_w = len(self.writer_pages[w])  # Total pages for writer w
-            Q_w = int(min(Q_target, P_w * L, r_max * N_w))
-            self.writer_quotas[w] = Q_w
-        
+        self.num_writers = len(self.writers)
+
         # Initialize exposure tracking (0 = never seen)
         self.line_exposure = {idx: 0 for idx in range(len(lines))}
-        
+
         # Statistics
-        self.total_samples_per_epoch = sum(self.writer_quotas.values())
-    
+        self.total_samples_per_epoch = self.quota_per_writer * self.num_writers
+        self.current_epoch = 0
+
     def __iter__(self):
         """
         Generate indices for one epoch.
-        Strategy: Sample from each writer up to their quota,
-        prioritizing lines with lowest exposure.
+
+        Strategy:
+        1. For each writer, get their lines sorted by exposure (lowest first)
+        2. Sample up to quota_per_writer lines
+        3. Skip lines that have reached max_exposure
+        4. If quota not met and all lines used, repeat from lowest exposure
+        5. Update exposure counts
         """
         epoch_indices = []
-        
+
+        self.current_epoch += 1
+
         # For each writer, sample up to quota
-        for w in self.writers:
-            quota = self.writer_quotas[w]
-            writer_pages = list(self.writer_pages[w])
-            random.shuffle(writer_pages)  # Randomize page order
-            
+        for writer_idx in self.writers:
+            writer_line_indices = self.writer_lines[writer_idx]
+            total_available = len(writer_line_indices)
+
+            # Sort lines by exposure (lowest first)
+            lines_sorted = sorted(writer_line_indices, key=lambda idx: self.line_exposure[idx])
+
             writer_epoch_indices = []
-            page_idx = 0
-            
-            # Cycle through pages until quota is filled
-            while len(writer_epoch_indices) < quota:
-                if page_idx >= len(writer_pages):
-                    # Wrapped around all pages, restart
-                    page_idx = 0
-                
-                page_id = writer_pages[page_idx]
-                page_line_indices = self.pages[page_id]
-                
-                # Get lines sorted by exposure (lowest first)
-                lines_with_exposure = [(idx, self.line_exposure[idx]) for idx in page_line_indices]
-                lines_with_exposure.sort(key=lambda x: x[1])  # Sort by exposure
-                
-                # Take up to L lines from this page
-                remaining_quota = quota - len(writer_epoch_indices)
-                num_to_take = min(self.L, len(lines_with_exposure), remaining_quota)
-                selected = [idx for idx, _ in lines_with_exposure[:num_to_take]]
-                
-                writer_epoch_indices.extend(selected)
-                
-                # Update exposure for selected lines
-                for idx in selected:
-                    self.line_exposure[idx] += 1
-                
-                page_idx += 1
-            
+
+            # Sample up to quota
+            for line_idx in lines_sorted:
+                if len(writer_epoch_indices) >= self.quota_per_writer:
+                    break
+
+                # Only sample if below max exposure
+                if self.line_exposure[line_idx] < self.max_exposure:
+                    writer_epoch_indices.append(line_idx)
+                    self.line_exposure[line_idx] += 1
+
+            # If quota not met, check if we can repeat any lines
+            if len(writer_epoch_indices) < self.quota_per_writer:
+                # Try to fill quota by repeating lines (if allowed)
+                for line_idx in lines_sorted:
+                    if len(writer_epoch_indices) >= self.quota_per_writer:
+                        break
+
+                    if self.line_exposure[line_idx] < self.max_exposure:
+                        writer_epoch_indices.append(line_idx)
+                        self.line_exposure[line_idx] += 1
+
             epoch_indices.extend(writer_epoch_indices)
-        
+
         # Shuffle final indices for random batching
         random.shuffle(epoch_indices)
-        
+
         return iter(epoch_indices)
-    
+
     def __len__(self):
         """Total samples per epoch."""
         return self.total_samples_per_epoch
-    
-    def get_coverage_report(self, writers):
+
+    def get_coverage_stats(self, writers):
         """
-        Generate coverage report: % of lines seen at least once per writer.
-        
-        Args:
-            writers: List of writer names
-        
+        Calculate coverage statistics: how many lines have been trained on.
+
         Returns:
-            Dict with coverage statistics per writer
+            Dictionary with overall and per-writer coverage statistics
         """
-        coverage = {}
-        
-        for w in self.writers:
-            writer_line_indices = self.writer_lines[w]
+        overall_stats = {
+            'total_lines': len(self.lines),
+            'seen_lines': 0,
+            'unseen_lines': 0,
+            'coverage_pct': 0.0,
+            'avg_exposure': 0.0,
+            'max_exposure_reached': 0,
+        }
+
+        per_writer_stats = {}
+
+        # Calculate overall stats
+        seen_count = sum(1 for exp in self.line_exposure.values() if exp > 0)
+        max_exp_count = sum(1 for exp in self.line_exposure.values() if exp >= self.max_exposure)
+
+        overall_stats['seen_lines'] = seen_count
+        overall_stats['unseen_lines'] = len(self.lines) - seen_count
+        overall_stats['coverage_pct'] = (seen_count / len(self.lines) * 100) if len(self.lines) > 0 else 0.0
+        overall_stats['avg_exposure'] = np.mean(list(self.line_exposure.values())) if self.line_exposure else 0.0
+        overall_stats['max_exposure_reached'] = max_exp_count
+
+        # Per-writer stats
+        for writer_idx in self.writers:
+            writer_line_indices = self.writer_lines[writer_idx]
             total_lines = len(writer_line_indices)
             seen_lines = sum(1 for idx in writer_line_indices if self.line_exposure[idx] > 0)
+            unseen_lines = total_lines - seen_lines
             coverage_pct = (seen_lines / total_lines * 100) if total_lines > 0 else 0.0
-            
-            coverage[w] = {
-                'writer_name': writers[w],
+            avg_exposure = np.mean([self.line_exposure[idx] for idx in writer_line_indices]) if total_lines > 0 else 0.0
+            max_exp_reached = sum(1 for idx in writer_line_indices if self.line_exposure[idx] >= self.max_exposure)
+
+            per_writer_stats[writer_idx] = {
+                'writer_name': writers[writer_idx],
                 'total_lines': total_lines,
                 'seen_lines': seen_lines,
-                'unseen_lines': total_lines - seen_lines,
+                'unseen_lines': unseen_lines,
                 'coverage_pct': coverage_pct,
-                'avg_exposure': np.mean([self.line_exposure[idx] for idx in writer_line_indices]) if total_lines > 0 else 0.0
+                'avg_exposure': avg_exposure,
+                'max_exposure_reached': max_exp_reached,
+                'all_lines_seen': (unseen_lines == 0)
             }
-        
-        return coverage
-    
+
+        return overall_stats, per_writer_stats
+
+    def print_coverage_report(self, writers):
+        """Print detailed coverage report."""
+        overall_stats, per_writer_stats = self.get_coverage_stats(writers)
+
+        print(f"\n{'='*80}")
+        print("TRAINING COVERAGE REPORT")
+        print(f"{'='*80}")
+        print(f"Total Epochs: {self.current_epoch}")
+        print(f"Quota per Writer per Epoch: {self.quota_per_writer}")
+        print(f"Max Exposure Allowed: {self.max_exposure}")
+        print(f"\n{'─'*80}")
+        print("OVERALL STATISTICS")
+        print(f"{'─'*80}")
+        print(f"Total Lines in Dataset: {overall_stats['total_lines']:,}")
+        print(f"Lines Trained On (≥1 time): {overall_stats['seen_lines']:,}")
+        print(f"Lines Never Seen: {overall_stats['unseen_lines']:,}")
+        print(f"Coverage: {overall_stats['coverage_pct']:.2f}%")
+        print(f"Average Exposure per Line: {overall_stats['avg_exposure']:.2f}")
+        print(f"Lines at Max Exposure ({self.max_exposure}x): {overall_stats['max_exposure_reached']:,}")
+
+        # Check if all lines trained
+        all_trained = overall_stats['unseen_lines'] == 0
+        if all_trained:
+            print(f"\n✅ ALL LINES HAVE BEEN TRAINED ON!")
+        else:
+            print(f"\n⚠️  NOT ALL LINES TRAINED - {overall_stats['unseen_lines']:,} lines never seen")
+
+        print(f"\n{'─'*80}")
+        print("PER-WRITER STATISTICS")
+        print(f"{'─'*80}")
+        print(f"{'Writer':<20} {'Total':<8} {'Seen':<8} {'Unseen':<8} {'Coverage':<10} {'Avg Exp':<8} {'All Seen?'}")
+        print(f"{'-'*80}")
+
+        for writer_idx in sorted(per_writer_stats.keys()):
+            stats = per_writer_stats[writer_idx]
+            writer_name = stats['writer_name'][:18]  # Truncate if too long
+            all_seen_marker = "✅" if stats['all_lines_seen'] else "❌"
+
+            print(f"{writer_name:<20} "
+                  f"{stats['total_lines']:<8} "
+                  f"{stats['seen_lines']:<8} "
+                  f"{stats['unseen_lines']:<8} "
+                  f"{stats['coverage_pct']:>7.2f}% "
+                  f"{stats['avg_exposure']:>8.2f} "
+                  f"{all_seen_marker}")
+
+        print(f"{'='*80}\n")
+
     def print_sampler_info(self, writers):
         """Print sampler configuration and statistics."""
-        if rank != 0:
-            return
-        
         print(f"\n{'='*70}")
         print("WRITER-BALANCED SAMPLER CONFIGURATION")
         print(f"{'='*70}")
-        print(f"  Lines per page cap (L):     {self.L}")
-        print(f"  Target quota (Q_target):    {self.Q_target}")
-        print(f"  Max oversampling (r_max):   {self.r_max}")
-        print(f"  Total samples per epoch:    {self.total_samples_per_epoch:,}")
-        print(f"\n  Per-writer quotas:")
-        print(f"  {'Writer':<25} {'Pages':<8} {'Lines':<8} {'Quota':<8} {'Samples/Epoch'}")
+        print(f"  Quota per Writer per Epoch: {self.quota_per_writer}")
+        print(f"  Maximum Exposure per Line:  {self.max_exposure}")
+        print(f"  Number of Writers:          {self.num_writers}")
+        print(f"  Total Samples per Epoch:    {self.total_samples_per_epoch:,}")
+        print(f"\n  Per-writer line counts:")
+        print(f"  {'Writer':<25} {'Total Lines':<12} {'Lines per Epoch'}")
         print(f"  {'-'*70}")
-        
-        for w in self.writers:
-            writer_name = writers[w]
-            N_w = len(self.writer_lines[w])
-            P_w = len(self.writer_pages[w])
-            Q_w = self.writer_quotas[w]
-            print(f"  {writer_name:<25} {P_w:<8} {N_w:<8} {Q_w:<8} {Q_w}")
+
+        for writer_idx in self.writers:
+            writer_name = writers[writer_idx]
+            total_lines = len(self.writer_lines[writer_idx])
+            print(f"  {writer_name:<25} {total_lines:<12,} {self.quota_per_writer}")
+
         print(f"{'='*70}\n")
 
 
@@ -2498,9 +2536,8 @@ class CheckpointManager:
                 f.write(f"  Triplet Weight:     {config.TRIPLET_WEIGHT}\n")
                 f.write(f"  Triplet Margin:     {config.TRIPLET_MARGIN}\n")
             f.write(f"\nSampler Configuration:\n")
-            f.write(f"Lines per Page Cap:   {config.LINES_PER_PAGE_CAP}\n")
-            f.write(f"Quota Target:         {config.QUOTA_TARGET}\n")
-            f.write(f"R Max:                {config.R_MAX}\n")
+            f.write(f"Quota per Writer:     300\n")
+            f.write(f"Max Exposure:         2\n")
             
             # Results
             f.write(f"\n{'='*70}\n")
@@ -2609,10 +2646,8 @@ def run_trial(trial, config_base, data_index):
         # Create sampler
         train_sampler = WriterBalancedSampler(
             split_data['train']['lines'],
-            split_data['train']['pages'],
-            L=config.LINES_PER_PAGE_CAP,
-            Q_target=config.QUOTA_TARGET,
-            r_max=config.R_MAX
+            quota_per_writer=300,
+            max_exposure=2
         )
 
         train_sampler.print_sampler_info(writers)
@@ -2768,7 +2803,10 @@ def run_trial(trial, config_base, data_index):
             checkpoint_manager.save_per_writer_plot(val_results['per_writer_results'], writers)
             checkpoint_manager.save_learning_rate_plot(history['lr'])
             checkpoint_manager.save_trial_summary(config, final_metrics, history)
-        
+
+            # Print training coverage report
+            train_sampler.print_coverage_report(writers)
+
             print(f"\n✅ Trial {trial.number} completed | Best Val Top-1: {best_val_top1*100:.2f}%\n")
 
         return best_val_top1
