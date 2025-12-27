@@ -28,6 +28,35 @@ That's it! The script automatically:
 - ✅ Coordinates via shared Optuna database
 - ✅ Handles interruptions gracefully
 
+## Quick Test Mode (RECOMMENDED FIRST!)
+
+**⚡ Before running the full search, test that everything works:**
+
+```bash
+python run_hyperparameter_search.py \
+  --data_root /path/to/Mirath_extracted_lines \
+  --checkpoint_dir ./test_checkpoint \
+  --quick_test
+```
+
+**Quick test uses minimal resources:**
+- **3 writers** (instead of 21)
+- **50 lines/writer** (instead of 300)
+- **Batch size 32** (instead of 128)
+- **5 epochs** (instead of 70)
+- **2 trials** (instead of 12)
+
+**⏱️ Time: ~5-10 minutes per trial** (instead of 24+ hours for full run)
+
+**🎯 Purpose:**
+- Verify data paths are correct
+- Ensure GPU/CUDA works
+- Check for code errors
+- Validate dataset structure
+- Test resumability
+
+**✅ Once quick test succeeds, run the full search!**
+
 ## How It Works
 
 ### Single GPU (Automatic)
