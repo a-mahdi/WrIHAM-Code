@@ -1703,13 +1703,13 @@ def create_scheduler(optimizer, config, steps_per_epoch):
 # TRAINING EPOCH
 # ============================================================
 
-def train_epoch(model, loader, loss_manager, optimizer, scheduler, scaler, 
-                config, epoch):
+def train_epoch(model, loader, loss_manager, optimizer, scheduler, scaler,
+                config, epoch, rank=0):
     """
     Train for one epoch.
-    
+
     Args:
-        model: Model instance (DDP wrapped)
+        model: Model instance
         loader: Training data loader
         loss_manager: LossManager instance
         optimizer: Optimizer
@@ -1717,8 +1717,8 @@ def train_epoch(model, loader, loss_manager, optimizer, scheduler, scaler,
         scaler: GradScaler for AMP
         config: Configuration object
         epoch: Current epoch number
-        rank: Process rank
-    
+        rank: Process rank/GPU ID (default: 0 for single GPU)
+
     Returns:
         avg_loss: Average loss for epoch
         accuracy: Training accuracy
@@ -2719,6 +2719,7 @@ def run_trial(trial, config_base, data_index):
     
         # Create model
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        rank = 0  # Single GPU mode (always rank 0, used for device and logging)
         model = create_model(config)
         model = model.to(device)
     
