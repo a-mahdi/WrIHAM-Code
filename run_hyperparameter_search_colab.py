@@ -391,10 +391,8 @@ class TrialConfig(BaseConfig):
         for key, value in hyperparams.items():
             setattr(self, key.upper(), value)
 
-        # Set writers
-        self.WRITERS = self.ALL_WRITERS if self.USE_ALL_WRITERS else self.SELECTED_WRITERS
-
-        # Will be set after indexing
+        # Writers and NUM_CLASSES will be set after data indexing
+        self.WRITERS = None
         self.NUM_CLASSES = None
 
 
@@ -3245,10 +3243,22 @@ def run_hyperparameter_search(config_base, n_trials):
     """
     # Build data index
     print("Building data index...")
+
+    # Determine which writers to use
+    if config_base.USE_ALL_WRITERS:
+        selected_writers = None  # Use all writers
+    else:
+        # Use subset: discover writers first, then select first N
+        all_writers = discover_writers(config_base.DATA_ROOT, split='train')
+        selected_writers = all_writers[:config_base.NUM_WRITERS_SUBSET]
+        print(f"\n✅ Using subset: {config_base.NUM_WRITERS_SUBSET} writers")
+        for i, w in enumerate(selected_writers, 1):
+            print(f"  {i}. {w}")
+
     writers, writer2idx, split_data = build_index(
         config_base.DATA_ROOT,
         splits=['train', 'val'],
-        selected_writers=config_base.SELECTED_WRITERS if not config_base.USE_ALL_WRITERS else None
+        selected_writers=selected_writers
     )
     data_index = (writers, writer2idx, split_data)
 
