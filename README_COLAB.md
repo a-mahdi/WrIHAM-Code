@@ -29,7 +29,7 @@ Recommended: **A100 GPU** (available in Colab Pro)
 
 The notebook guides you through:
 1. ✅ Mount Google Drive
-2. ✅ Upload script
+2. ✅ Download script from GitHub (automatically gets latest version!)
 3. ✅ Install dependencies
 4. ✅ Configure paths
 5. ✅ Run quick test (10-20 min)
