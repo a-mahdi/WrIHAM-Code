@@ -2574,16 +2574,12 @@ class CheckpointManager:
     def save_trial_summary(self, config, metrics, history):
         """
         Save comprehensive trial summary.
-        
+
         Args:
             config: Trial configuration
             metrics: Final metrics
             history: Training history
-            rank: Process rank
         """
-        if rank != 0:
-            return
-        
         summary_path = self.trial_dir / 'trial_summary.txt'
         
         with open(summary_path, 'w') as f:
