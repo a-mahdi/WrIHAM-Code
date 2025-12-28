@@ -3314,19 +3314,23 @@ def run_hyperparameter_search(config_base, n_trials):
         print(f"{'='*70}\n")
 
     # Run optimization
-    # Calculate how many trials still needed
-    n_completed = len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE])
-    n_remaining = max(0, n_trials - n_completed)
+    # Calculate how many trials still needed (counts ALL trials: completed, pruned, failed)
+    total_trials_attempted = len(study.trials)
+    n_remaining = max(0, n_trials - total_trials_attempted)
 
     if n_remaining > 0:
+        print(f"\n🚀 Running {n_remaining} more trial(s)...\n")
         study.optimize(
             lambda trial: run_trial(trial, config_base, data_index),
             n_trials=n_remaining,
             show_progress_bar=True
         )
     else:
-        print(f"\n✅ All {n_trials} trials already completed. Skipping optimization.")
-        print(f"   Use --n_trials to run more trials.\n")
+        print(f"\n✅ All {n_trials} trials already attempted.")
+        print(f"   Attempted: {total_trials_attempted} (Completed: {len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE])}, "
+              f"Pruned: {len([t for t in study.trials if t.state == optuna.trial.TrialState.PRUNED])}, "
+              f"Failed: {len([t for t in study.trials if t.state == optuna.trial.TrialState.FAIL])})")
+        print(f"   Use --n_trials with a higher number to run more trials.\n")
         
     # Print results
     print("\n" + "="*70)

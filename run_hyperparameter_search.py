@@ -3273,7 +3273,8 @@ def run_hyperparameter_search(config_base, n_trials):
     # Run optimization
     # Calculate how many trials still needed
     n_completed = len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE])
-    n_remaining = max(0, n_trials - n_completed)
+    total_trials_attempted = len(study.trials)
+    n_remaining = max(0, n_trials - total_trials_attempted)
 
     if n_remaining > 0:
         study.optimize(
