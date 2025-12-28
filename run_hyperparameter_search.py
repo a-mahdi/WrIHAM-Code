@@ -229,29 +229,24 @@ class HyperparameterSpace:
             triplet_margin = 0.5
         
         # ========== MODEL-SPECIFIC PARAMETERS ==========
-        if model_type == 'convnext':
-            # ConvNeXt-specific
-            embedding_dim = trial.suggest_categorical('embedding_dim', [768, 1024])
-            
-            # Backbone freezing (important for preventing overfitting)
-            freeze_backbone = trial.suggest_categorical('freeze_backbone', [True, False])
-            if freeze_backbone:
-                # Freeze early layers, train later layers
-                freeze_layers = trial.suggest_int('freeze_layers', 15, 25, step=5)
-            else:
-                freeze_layers = 0
-            
-        else:  # ViT
-            # ViT-specific
-            embedding_dim = trial.suggest_categorical('embedding_dim', [768])  # Fixed for ViT
-            
-            # ViT backbone freezing
-            freeze_backbone = trial.suggest_categorical('freeze_backbone', [True, False])
-            if freeze_backbone:
-                # Freeze transformer layers
-                freeze_layers = trial.suggest_int('freeze_layers', 6, 10, step=2)
-            else:
-                freeze_layers = 0
+        # Use unified search space for all models (Optuna requirement)
+        # Suggest from full range, then apply model-specific constraints
+        embedding_dim_suggested = trial.suggest_categorical('embedding_dim', [768, 1024])
+        freeze_backbone = trial.suggest_categorical('freeze_backbone', [True, False])
+
+        if freeze_backbone:
+            # Unified range for all models (Optuna requirement)
+            freeze_layers = trial.suggest_int('freeze_layers', 6, 25)
+        else:
+            freeze_layers = 0
+
+        # Apply model-specific constraints
+        if model_type == 'vit':
+            # ViT only supports 768 embedding dimension
+            embedding_dim = 768
+        else:
+            # ConvNeXt can use suggested dimension
+            embedding_dim = embedding_dim_suggested
         
         # ========== TRAINING SCHEDULE ==========
         # Warmup epochs (helps with stability)
