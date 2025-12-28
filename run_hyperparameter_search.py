@@ -2745,9 +2745,10 @@ def run_trial(trial, config_base, data_index):
             'val_macro_map': [],
             'lr': []
         }
-    
+
         best_val_top1 = 0.0
-    
+        best_per_writer_results = None  # Will be set when we find best epoch
+
         # Training loop
         for epoch in range(config.EPOCHS):
             # Train
@@ -2807,7 +2808,8 @@ def run_trial(trial, config_base, data_index):
                 best_val_top1 = val_metrics['macro_top1']
                 best_y_true = y_true
                 best_y_pred = y_pred
-        
+                best_per_writer_results = val_metrics['per_writer_results']  # Save best per-writer results
+
             # Save checkpoint
             if rank == 0:
                 metrics = {
@@ -2832,16 +2834,16 @@ def run_trial(trial, config_base, data_index):
                         checkpoint_manager.save_confusion_matrix(y_true, y_pred, writers, normalize=False)
         
             # Report to Optuna (for pruning)
-            trial.report(val_results['macro_top1'], epoch)
-        
+            trial.report(val_metrics['macro_top1'], epoch)
+
             # Check if trial should be pruned
             if trial.should_prune():
                 if rank == 0:
                     print(f"\n⚠️  Trial {trial.number} pruned at epoch {epoch+1}")
                 raise optuna.TrialPruned()
-        
+
             # Early stopping
-            if early_stopping(val_results['macro_top1'], epoch):
+            if early_stopping(val_metrics['macro_top1'], epoch):
                 if rank == 0:
                     print(f"\n🛑 Early stopping at epoch {epoch+1}")
                 break
@@ -2852,12 +2854,12 @@ def run_trial(trial, config_base, data_index):
                 'val_macro_top1': best_val_top1,
                 'val_macro_top5': history['val_macro_top5'][np.argmax(history['val_macro_top1'])],
                 'val_macro_map': history['val_macro_map'][np.argmax(history['val_macro_top1'])],
-                'per_writer_results': val_results['per_writer_results']
+                'per_writer_results': best_per_writer_results
             }
-        
+
             checkpoint_manager.save_final_model(model, final_metrics, history)
             checkpoint_manager.save_training_plots(history, len(history['train_loss'])-1)
-            checkpoint_manager.save_per_writer_plot(val_results['per_writer_results'], writers)
+            checkpoint_manager.save_per_writer_plot(best_per_writer_results, writers)
             checkpoint_manager.save_learning_rate_plot(history['lr'])
             checkpoint_manager.save_trial_summary(config, final_metrics, history)
 
