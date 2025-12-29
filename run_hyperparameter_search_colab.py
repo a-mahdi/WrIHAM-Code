@@ -302,12 +302,15 @@ class HyperparameterSpace:
         gradient_clip_norm = trial.suggest_float('gradient_clip_norm', 0.8, 1.5)
         
         # ========== BATCH SIZE ==========
-        # Fixed batch size for 12 trials (reduce search space)
-        # Can adjust based on GPU memory
+        # Model-specific batch sizes (ConvNeXt uses more memory)
         if quick_test:
             batch_size = 32  # Small batch for quick testing
         else:
-            batch_size = 128  # Full batch for production
+            # ConvNeXt needs smaller batch due to higher memory usage
+            if model_type == 'convnext':
+                batch_size = 64  # Half of ViT batch size
+            else:
+                batch_size = 128  # ViT can handle larger batches
         
         return {
             'model_type': model_type,
