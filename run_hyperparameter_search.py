@@ -2863,12 +2863,39 @@ def run_trial(trial, config_base, data_index):
 
             print(f"\n✅ Trial {trial.number} completed | Best Val Top-1: {best_val_top1*100:.2f}%\n")
 
+        # Clean up GPU memory before next trial
+        import gc
+        del model, optimizer, scheduler, scaler, train_loader, val_loader
+        torch.cuda.empty_cache()
+        gc.collect()
+
         return best_val_top1
 
     except optuna.TrialPruned:
         # Trial was pruned - this is expected, re-raise
         if rank == 0:
             print(f"\n⚠️  Trial {trial.number} was pruned (early stopping by Optuna)")
+
+        # Clean up GPU memory before next trial
+        import gc
+        try:
+            if 'model' in locals():
+                del model
+            if 'optimizer' in locals():
+                del optimizer
+            if 'scheduler' in locals():
+                del scheduler
+            if 'scaler' in locals():
+                del scaler
+            if 'train_loader' in locals():
+                del train_loader
+            if 'val_loader' in locals():
+                del val_loader
+            torch.cuda.empty_cache()
+            gc.collect()
+        except:
+            pass
+
         raise
 
     except Exception as e:
@@ -2890,6 +2917,32 @@ def run_trial(trial, config_base, data_index):
                 print(f"   Error log saved to: {error_log_path}")
             except:
                 pass
+
+        # Clean up GPU memory before next trial
+        import gc
+        try:
+            # Delete large objects if they exist
+            if 'model' in locals():
+                del model
+            if 'optimizer' in locals():
+                del optimizer
+            if 'scheduler' in locals():
+                del scheduler
+            if 'scaler' in locals():
+                del scaler
+            if 'train_loader' in locals():
+                del train_loader
+            if 'val_loader' in locals():
+                del val_loader
+
+            # Clear CUDA cache
+            torch.cuda.empty_cache()
+            gc.collect()
+
+            if rank == 0:
+                print(f"   GPU memory cleared for next trial")
+        except:
+            pass
 
         # Re-raise the exception so Optuna marks this trial as failed
         raise
