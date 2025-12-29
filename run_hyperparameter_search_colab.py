@@ -290,7 +290,10 @@ class HyperparameterSpace:
         else:
             # ConvNeXt can use suggested dimension
             embedding_dim = embedding_dim_suggested
-        
+
+        # Record actual used embedding_dim (may differ from suggested for ViT)
+        trial.set_user_attr('actual_embedding_dim', embedding_dim)
+
         # ========== TRAINING SCHEDULE ==========
         # Warmup epochs (helps with stability)
         warmup_epochs = trial.suggest_int('warmup_epochs', 5, 10)
