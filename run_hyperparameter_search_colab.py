@@ -1831,13 +1831,14 @@ def train_epoch(model, loader, loss_manager, optimizer, scheduler, scaler,
         scaler.update()
         scheduler.step()
         
-        # Statistics (only compute accuracy without MixUp)
+        # Statistics
+        # Note: With MixUp, we still compute accuracy using original labels for monitoring
+        # (though the model was trained on mixed labels)
         with torch.no_grad():
-            if not (loss_manager.use_mixup and config.MIXUP_ALPHA > 0):
-                logits, _ = model(images)
-                _, predicted = logits.max(1)
-                total += labels.size(0)
-                correct += predicted.eq(labels).sum().item()
+            logits, _ = model(images)
+            _, predicted = logits.max(1)
+            total += labels.size(0)
+            correct += predicted.eq(labels).sum().item()
         
         # Update running statistics
         running_loss += loss_dict['total_loss']
